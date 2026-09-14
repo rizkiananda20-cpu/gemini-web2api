@@ -49,7 +49,24 @@ def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
-        return "", None
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = [
+            cookie_file,
+            os.path.join(base_dir, "cookie.json"),
+            os.path.join(base_dir, "cookie.txt"),
+            "./cookie.json",
+            "cookie.json",
+            os.path.expanduser("~/.config/gemini-web2api/cookie.json")
+        ]
+        found = False
+        for c in candidates:
+            if c and os.path.exists(c):
+                cookie_file = c
+                CONFIG["cookie_file"] = c
+                found = True
+                break
+        if not found:
+            return "", None
     try:
         mtime = os.path.getmtime(cookie_file)
         if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
@@ -60,6 +77,8 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            if not CONFIG.get("xsrf_token") and data.get("xsrf_token"):
+                CONFIG["xsrf_token"] = data.get("xsrf_token")
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -69,6 +88,68 @@ def load_cookie() -> tuple:
     except Exception as e:
         log(f"Cookie load error: {e}")
         return _cookie_cache["str"], _cookie_cache["sapisid"]
+
+
+def save_xsrf_token(token: str):
+    """Save recovered xsrf_token into config and cookie file."""
+    CONFIG["xsrf_token"] = token
+    cookie_file = CONFIG.get("cookie_file")
+    if cookie_file and os.path.exists(cookie_file):
+        try:
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            cdata["xsrf_token"] = token
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                json.dump(cdata, f, indent=2)
+        except Exception:
+            pass
+
+
+def fetch_latest_bl() -> str | None:
+    """Fetch the latest gemini_bl and SNlM0e (xsrf) from gemini.google.com page."""
+    try:
+        cookie_str, sapisid = load_cookie()
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        prefix = _account_prefix()
+        target_url = f"https://gemini.google.com{prefix}/app"
+        req = urllib.request.Request(target_url, headers=headers)
+        ctx = _get_ssl_ctx()
+        proxy = CONFIG.get("proxy")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx))
+            resp = opener.open(req, timeout=15)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        html = resp.read().decode("utf-8", errors="replace")
+
+        if not CONFIG.get("xsrf_token"):
+            m_xsrf = re.search(r'"SNlM0e":"([^"]+)"', html)
+            if m_xsrf:
+                save_xsrf_token(m_xsrf.group(1))
+                log(f"XSRF token auto-detected from page: {CONFIG['xsrf_token']}")
+
+        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        log(f"BL auto-update fetch failed: {e}")
+    return None
+
+
+def update_bl_if_needed() -> bool:
+    """Attempt to fetch and update gemini_bl. Returns True if updated."""
+    new_bl = fetch_latest_bl()
+    if new_bl and new_bl != CONFIG["gemini_bl"]:
+        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
+        CONFIG["gemini_bl"] = new_bl
+        return True
+    return False
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -204,9 +285,9 @@ def extract_response_text(raw: str) -> str:
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
+    headers = _build_headers()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
-    headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
@@ -224,6 +305,29 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except urllib.error.HTTPError as e:
+            if e.code == 405 and update_bl_if_needed():
+                url = _get_url()
+                log("Retrying with updated BL...")
+                last_err = e
+                continue
+            if e.code == 400:
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                    m = re.search(r'\["xsrf",\s*"([^"]+)"', err_body)
+                    if m:
+                        new_xsrf = m.group(1)
+                        log(f"XSRF auto-recovered from 400: {new_xsrf}")
+                        save_xsrf_token(new_xsrf)
+                        body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+                        last_err = e
+                        continue
+                except Exception as ex:
+                    log(f"XSRF recovery parse error: {ex}")
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -240,16 +344,26 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
+    headers = _build_headers()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
-    headers = _build_headers()
     client = _get_httpx_client()
 
-    last_err = None
     emitted_raw_text = ""
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                if resp.status_code == 405:
+                    update_bl_if_needed()
+                    raise RuntimeError("HTTP 405, BL updated")
+                if resp.status_code == 400:
+                    err_text = resp.read().decode("utf-8", errors="replace")
+                    m = re.search(r'\["xsrf",\s*"([^"]+)"', err_text)
+                    if m:
+                        new_xsrf = m.group(1)
+                        log(f"XSRF auto-recovered from stream 400: {new_xsrf}")
+                        save_xsrf_token(new_xsrf)
+                    raise RuntimeError("HTTP 400 Bad Request, recovered XSRF")
                 resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
@@ -273,8 +387,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 yield delta
             return
         except Exception as e:
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
-    raise last_err
+            log(f"Stream error ({e}), retrying via non-streaming fallback...")
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            if text:
+                yield text
+            return

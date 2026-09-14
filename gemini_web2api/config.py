@@ -8,10 +8,10 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
-    "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+    "gemini_bl": "boq_assistant-bard-web-server_20260910.05_p2",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-3.7-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -32,7 +32,13 @@ def load_config(path: str = None):
 
 def find_config():
     """Search for config file in standard locations."""
-    for p in ["./config.json", os.path.expanduser("~/.config/gemini-web2api/config.json")]:
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        "./config.json",
+        os.path.join(base_dir, "config.json"),
+        os.path.expanduser("~/.config/gemini-web2api/config.json")
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
     return None

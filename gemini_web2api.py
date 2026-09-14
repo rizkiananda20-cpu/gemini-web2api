@@ -53,10 +53,10 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
-    "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+    "gemini_bl": "boq_assistant-bard-web-server_20260910.05_p2",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-3.7-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -116,10 +116,25 @@ def log(msg: str):
 def load_cookie() -> tuple:
     """Load cookie from file. Returns (cookie_str, sapisid)."""
     cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file:
-        return "", None
-    if not os.path.exists(cookie_file):
-        return "", None
+    if not cookie_file or not os.path.exists(cookie_file):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            cookie_file,
+            os.path.join(base_dir, "cookie.json"),
+            os.path.join(base_dir, "cookie.txt"),
+            "./cookie.json",
+            "cookie.json",
+            os.path.expanduser("~/.config/gemini-web2api/cookie.json")
+        ]
+        found = False
+        for c in candidates:
+            if c and os.path.exists(c):
+                cookie_file = c
+                CONFIG["cookie_file"] = c
+                found = True
+                break
+        if not found:
+            return "", None
     try:
         with open(cookie_file, "r") as f:
             content = f.read().strip()
@@ -127,6 +142,8 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            if not CONFIG.get("xsrf_token") and data.get("xsrf_token"):
+                CONFIG["xsrf_token"] = data.get("xsrf_token")
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -135,6 +152,21 @@ def load_cookie() -> tuple:
     except Exception as e:
         log(f"Cookie load error: {e}")
         return "", None
+
+
+def save_xsrf_token(token: str):
+    """Save recovered xsrf_token into config and cookie file."""
+    CONFIG["xsrf_token"] = token
+    cookie_file = CONFIG.get("cookie_file")
+    if cookie_file and os.path.exists(cookie_file):
+        try:
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            cdata["xsrf_token"] = token
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                json.dump(cdata, f, indent=2)
+        except Exception:
+            pass
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -161,11 +193,17 @@ def apply_chat_persistence_flags(inner: list) -> None:
 
 
 def fetch_latest_bl() -> Optional[str]:
-    """Fetch the latest gemini_bl from gemini.google.com page."""
+    """Fetch the latest gemini_bl and SNlM0e (xsrf) from gemini.google.com page."""
     try:
-        req = urllib.request.Request(
-            "https://gemini.google.com/app",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        cookie_str, sapisid = load_cookie()
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        prefix = account_prefix()
+        target_url = f"https://gemini.google.com{prefix}/app"
+        req = urllib.request.Request(target_url, headers=headers)
         ctx = ssl.create_default_context()
         proxy = CONFIG.get("proxy")
         if proxy:
@@ -176,6 +214,14 @@ def fetch_latest_bl() -> Optional[str]:
         else:
             resp = urllib.request.urlopen(req, context=ctx, timeout=15)
         html = resp.read().decode("utf-8", errors="replace")
+
+        # Auto-detect SNlM0e (XSRF token) if not set
+        if not CONFIG.get("xsrf_token"):
+            m_xsrf = re.search(r'"SNlM0e":"([^"]+)"', html)
+            if m_xsrf:
+                save_xsrf_token(m_xsrf.group(1))
+                log(f"XSRF token auto-detected from page: {CONFIG['xsrf_token']}")
+
         m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
         if m:
             return m.group(1)
@@ -245,6 +291,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     inner[68] = 1
     inner[79] = model_id
 
+    cookie_str, sapisid = load_cookie()
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
@@ -267,7 +314,6 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     if prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
 
-    cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
@@ -299,6 +345,20 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 log("Retrying with updated BL...")
                 last_err = e
                 continue
+            if e.code == 400:
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                    m = re.search(r'\["xsrf",\s*"([^"]+)"', err_body)
+                    if m:
+                        new_xsrf = m.group(1)
+                        log(f"XSRF auto-recovered from 400: {new_xsrf}")
+                        save_xsrf_token(new_xsrf)
+                        params["at"] = new_xsrf
+                        body = urllib.parse.urlencode(params).encode()
+                        last_err = e
+                        continue
+                except Exception as ex:
+                    log(f"XSRF recovery parse error: {ex}")
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -336,6 +396,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     inner[68] = 1
     inner[79] = model_id
 
+    cookie_str, sapisid = load_cookie()
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
@@ -357,7 +418,6 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     }
     if prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
@@ -378,6 +438,17 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                if resp.status_code == 405:
+                    update_bl_if_needed()
+                    raise RuntimeError("HTTP 405, BL updated")
+                if resp.status_code == 400:
+                    err_text = resp.read().decode("utf-8", errors="replace")
+                    m = re.search(r'\["xsrf",\s*"([^"]+)"', err_text)
+                    if m:
+                        new_xsrf = m.group(1)
+                        log(f"XSRF auto-recovered from stream 400: {new_xsrf}")
+                        save_xsrf_token(new_xsrf)
+                    raise RuntimeError("HTTP 400 Bad Request, recovered XSRF")
                 resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
@@ -410,15 +481,12 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
         except Exception as e:
-            if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
-                if update_bl_if_needed():
-                    log("BL updated, falling back to non-streaming for this request")
-                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
-                    text = extract_response_text(raw)
-                    if text:
-                        yield text
-                    return
-            raise
+            log(f"Stream error ({e}), retrying request via non-streaming fallback...")
+            raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+            text = extract_response_text(raw)
+            if text:
+                yield text
+            return
 
 
 def clean_gemini_text(text: str, strip: bool = True) -> str:
