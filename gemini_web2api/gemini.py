@@ -129,7 +129,11 @@ def fetch_latest_bl() -> str | None:
         html = resp.read().decode("utf-8", errors="replace")
 
         if not CONFIG.get("xsrf_token"):
-            m_xsrf = re.search(r'"SNlM0e":"([^"]+)"', html)
+            m_xsrf = re.search(r'"FdrFJe"\s*:\s*"(-?\d+)"', html)
+            if not m_xsrf:
+                m_xsrf = re.search(r'"SNlM0e":"([^"]+)"', html)
+            if not m_xsrf:
+                m_xsrf = re.search(r'SNlM0e[\'":=\s]*([A-Za-z0-9_\-]{10,})', html)
             if m_xsrf:
                 save_xsrf_token(m_xsrf.group(1))
                 log(f"XSRF token auto-detected from page: {CONFIG['xsrf_token']}")
@@ -166,7 +170,34 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+MODEL_IDS = {
+    "gemini-3.8-flash": "56fdd199312815e2",
+    "gemini-3.7-flash": "56fdd199312815e2",
+    "gemini-3.6-flash": "56fdd199312815e2",
+    "gemini-3.5-flash": "56fdd199312815e2",
+    "gemini-3.1-pro": "e6fa609c3fa255c0",
+    "gemini-flash-lite": "8c46e95b1a07cecc",
+    "gemini-3.5-flash-thinking": "56fdd199312815e2",
+    "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
+    "gemini-auto": None,
+}
+
+
+def build_model_header(model_name: str, model_id: int):
+    mid = MODEL_IDS.get(model_name)
+    if not mid:
+        return None
+    try:
+        return json.dumps(
+            [1, None, None, None, mid, None, None, 0,
+             [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
+             None, None, model_id, 0, str(uuid.uuid4())],
+            separators=(",", ":"))
+    except Exception:
+        return None
+
+
+def _build_headers(model_name: str = None, model_id: int = None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -182,6 +213,10 @@ def _build_headers() -> dict:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    if model_name and model_id is not None:
+        hdr = build_model_header(model_name, model_id)
+        if hdr:
+            headers["x-goog-ext-525001261-jspb"] = hdr
     return headers
 
 
@@ -283,9 +318,9 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, model_name: str = None) -> str:
     """Non-streaming generation with retry."""
-    headers = _build_headers()
+    headers = _build_headers(model_name, model_id)
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     ctx = _get_ssl_ctx()
@@ -336,15 +371,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, model_name: str = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name)
         if text:
             yield text
         return
 
-    headers = _build_headers()
+    headers = _build_headers(model_name, model_id)
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     client = _get_httpx_client()

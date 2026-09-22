@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "xsrf_token": None,
     "default_model": "gemini-3.7-flash",
     "log_requests": True,
-    "cookie_file": None,
+    "cookie_file": "cookie.json",
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
@@ -71,6 +71,10 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    "gemini-3.8-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Latest all-around model (Gemini 3.8 Flash)",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.7 Flash)",
@@ -105,12 +109,46 @@ MODELS = {
     },
 }
 
+# Verified internal model IDs (Issue #82 / PR #95)
+MODEL_IDS = {
+    "gemini-3.8-flash": "56fdd199312815e2",
+    "gemini-3.7-flash": "56fdd199312815e2",
+    "gemini-3.6-flash": "56fdd199312815e2",
+    "gemini-3.5-flash": "56fdd199312815e2",
+    "gemini-3.1-pro": "e6fa609c3fa255c0",
+    "gemini-flash-lite": "8c46e95b1a07cecc",
+    "gemini-3.5-flash-thinking": "56fdd199312815e2",
+    "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
+    "gemini-auto": None,
+}
+
+def build_model_header(model_name: str, model_id: int) -> Optional[str]:
+    """Build the x-goog-ext-525001261-jspb model-selection header."""
+    mid = MODEL_IDS.get(model_name)
+    if not mid:
+        return None
+    try:
+        return json.dumps(
+            [1, None, None, None, mid, None, None, 0,
+             [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
+             None, None, model_id, 0, str(uuid.uuid4())],
+            separators=(",", ":"))
+    except Exception:
+        return None
+
 # ─── Utilities ───────────────────────────────────────────────────────────────
 
 def log(msg: str):
-    if CONFIG["log_requests"]:
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+    if CONFIG.get("log_requests", True):
+        sys.stderr.write(line)
         sys.stderr.flush()
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_web2api.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 def load_cookie() -> tuple:
@@ -193,7 +231,7 @@ def apply_chat_persistence_flags(inner: list) -> None:
 
 
 def fetch_latest_bl() -> Optional[str]:
-    """Fetch the latest gemini_bl and SNlM0e (xsrf) from gemini.google.com page."""
+    """Fetch the latest gemini_bl and SNlM0e/FdrFJe (xsrf) from gemini.google.com page."""
     try:
         cookie_str, sapisid = load_cookie()
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -210,14 +248,18 @@ def fetch_latest_bl() -> Optional[str]:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                 urllib.request.HTTPSHandler(context=ctx))
-            resp = opener.open(req, timeout=15)
+            resp = opener.open(req, timeout=10)
         else:
-            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+            resp = urllib.request.urlopen(req, context=ctx, timeout=10)
         html = resp.read().decode("utf-8", errors="replace")
 
-        # Auto-detect SNlM0e (XSRF token) if not set
+        # Auto-detect XSRF token (FdrFJe or SNlM0e) if not set
         if not CONFIG.get("xsrf_token"):
-            m_xsrf = re.search(r'"SNlM0e":"([^"]+)"', html)
+            m_xsrf = re.search(r'"FdrFJe"\s*:\s*"(-?\d+)"', html)
+            if not m_xsrf:
+                m_xsrf = re.search(r'"SNlM0e":"([^"]+)"', html)
+            if not m_xsrf:
+                m_xsrf = re.search(r'SNlM0e[\'":=\s]*([A-Za-z0-9_\-]{10,})', html)
             if m_xsrf:
                 save_xsrf_token(m_xsrf.group(1))
                 log(f"XSRF token auto-detected from page: {CONFIG['xsrf_token']}")
@@ -266,7 +308,7 @@ def upload_images(images: list) -> list:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, model_name: str = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
     if file_refs:
@@ -318,6 +360,9 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    model_hdr = build_model_header(model_name, model_id) if model_name else None
+    if model_hdr:
+        headers["x-goog-ext-525001261-jspb"] = model_hdr
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
@@ -371,7 +416,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None, model_name: str = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
     if file_refs:
@@ -422,12 +467,15 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    model_hdr = build_model_header(model_name, model_id) if model_name else None
+    if model_hdr:
+        headers["x-goog-ext-525001261-jspb"] = model_hdr
 
     proxy = CONFIG.get("proxy")
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, model_name)
         text = extract_response_text(raw)
         if text:
             yield text
@@ -830,8 +878,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None, None, None, f"Unknown model: {model_name}"
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, model_name=None):
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, model_name)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -871,7 +919,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -890,7 +938,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, model_name)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1145,9 +1193,14 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
-    new_bl = fetch_latest_bl()
-    if new_bl:
-        CONFIG["gemini_bl"] = new_bl
+    import threading
+    def _bg_init():
+        try:
+            update_bl_if_needed()
+        except Exception as e:
+            log(f"Background BL init: {e}")
+
+    threading.Thread(target=_bg_init, daemon=True).start()
 
     class ThreadedServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
