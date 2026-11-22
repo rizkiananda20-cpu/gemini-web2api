@@ -9,31 +9,16 @@ import re
 from urllib.parse import urlparse
 
 from .config import CONFIG
-from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
+from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log, _fetch_gemini_page_html, _is_login_redirect
 
 
 def _get_page_tokens() -> dict:
     """Fetch WIZ_global_data tokens from Gemini page (Push-ID, X-Client-Pctx)."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
     cookie_str, sapisid = load_cookie()
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
     try:
-        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            resp = opener.open(req, timeout=30)
-        else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        html = resp.read().decode()
+        html, final_url = _fetch_gemini_page_html(cookie_str, sapisid, timeout=30)
+        if _is_login_redirect(final_url, html):
+            html, _ = _fetch_gemini_page_html("", None, timeout=30)
         tokens = {}
         for key, pattern in [
             ("push_id", r'"qKIAYe":"([^"]+)"'),

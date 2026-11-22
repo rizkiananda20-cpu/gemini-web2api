@@ -1,4 +1,5 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+import ipaddress
 import json
 import time
 import uuid
@@ -8,10 +9,34 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, log, update_cookie_payload
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+
+
+def _is_loopback(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return addr.is_loopback or bool(getattr(addr, "ipv4_mapped", None) and addr.ipv4_mapped.is_loopback)
+    except ValueError:
+        return False
+
+
+def _extract_reasoning_effort(req: dict):
+    """Extract reasoning_effort / thinkingLevel from OpenAI or Gemini request payload."""
+    if not isinstance(req, dict):
+        return None
+    effort = req.get("reasoning_effort")
+    if not effort and isinstance(req.get("reasoning"), dict):
+        effort = req["reasoning"].get("effort")
+    if not effort and isinstance(req.get("thinkingConfig"), dict):
+        effort = req["thinkingConfig"].get("thinkingLevel")
+    if not effort and isinstance(req.get("generationConfig"), dict):
+        gen_cfg = req["generationConfig"]
+        if isinstance(gen_cfg.get("thinkingConfig"), dict):
+            effort = gen_cfg["thinkingConfig"].get("thinkingLevel")
+    return effort
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -116,6 +141,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return False
 
     def do_OPTIONS(self):
+        if self.path.split("?", 1)[0] == "/v1/cookies":
+            origin = self.headers.get("Origin", "")
+            if not origin.startswith("chrome-extension://"):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Gemini-Cookie-Sync")
+            self.end_headers()
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -127,19 +164,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            clean_path = self.path.split("?", 1)[0]
+            if clean_path in ("/v1/models", "/models"):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif clean_path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif clean_path in ("/", "/health", "/healthz"):
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -152,10 +190,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
-            if self.path == "/v1/chat/completions":
+            clean_path = self.path.split("?", 1)[0]
+            if clean_path == "/v1/chat/completions":
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif clean_path == "/v1/responses":
                 self._handle_responses(body)
+            elif clean_path == "/v1/cookies":
+                self._handle_update_cookies(body)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
@@ -168,8 +209,39 @@ class GeminiHandler(BaseHTTPRequestHandler):
             log(f"POST error: {e}")
             try:
                 self.send_json({"error": {"message": str(e)}}, 500)
-            except:
+            except Exception:
                 pass
+
+    # ─── /v1/cookies ──────────────────────────────────────────────────────────
+
+    def _cookie_sync_allowed(self) -> bool:
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("chrome-extension://"):
+            return False
+        if self.headers.get("X-Gemini-Cookie-Sync") != "1":
+            return False
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        if host and host not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        if not (CONFIG.get("api_keys") or []):
+            client_ip = self.client_address[0] if self.client_address else ""
+            if not _is_loopback(client_ip):
+                return False
+        return True
+
+    def _handle_update_cookies(self, body: bytes):
+        if not self._cookie_sync_allowed():
+            self.send_json({"error": {"message": "forbidden cookie sync request"}}, 403)
+            return
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        ok, err_msg, status = update_cookie_payload(req)
+        if not ok:
+            self.send_json({"error": {"message": err_msg}}, status)
+            return
+        self.send_json({"status": "ok"})
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
@@ -179,7 +251,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -200,6 +274,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and (not tools or tool_choice == "none"):
+            stream_iter = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
             try:
                 self._start_sse()
                 first_chunk = {
@@ -215,7 +290,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name):
+                for delta in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -229,10 +304,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -269,7 +347,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", CONFIG["default_model"]),
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -485,16 +565,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
                             "model": model_name, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
 
-    # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
+    # ─── /v1beta/models & /v1/models/{model}:generateContent ─────────────────
 
     def _handle_google_generate(self, body: bytes, stream: bool):
         req = self._parse_body(body)
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        m = re.match(r'/v1beta/models/([^:?]+)', self.path)
+        m = re.match(r'/v1(?:beta)?/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
+            model_name,
+            reasoning_effort=_extract_reasoning_effort(req),
+        )
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -515,10 +598,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
+            stream_iter = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in stream_iter:
                     if not delta:
                         continue
                     full_text += delta
@@ -543,6 +627,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+            finally:
+                if hasattr(stream_iter, "close"):
+                    stream_iter.close()
             return
 
         try:

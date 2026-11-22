@@ -170,17 +170,13 @@ var DEFAULT_CONFIG = {
   // 流式请求的 CPU 时间在数据到达时重置，所以不受此严格限制
   // 但初始连接和第一个数据块必须在超时内到达
   requestTimeoutSec: 28,
+  ticketTimeoutSec: 15,
+  sendModelTicket: true,
 
   // ---- Gemini 构建标签 ----
   // Gemini 前端的版本标识，用于 API 请求的 URL 参数
   // 如果遇到 405 Method Not Allowed 错误，说明此值已过期
-  // 更新方法：
-  //   1. 浏览器打开 https://gemini.google.com/app
-  //   2. 按 F12 打开开发者工具
-  //   3. 切换到 Network（网络）标签
-  //   4. 在任意请求的 URL 中搜索 "boq_assistant"
-  //   5. 复制最新版本号，如 "boq_assistant-bard-web-server_20260730.02_p0"
-  geminiBl: 'boq_assistant-bard-web-server_20260716.08_p0',
+  geminiBl: 'boq_gemini-web-uiserver_20261122.06_p0',
 
   // ---- 多账户支持 ----
   // Google 支持在同一个浏览器中登录多个账户
@@ -439,7 +435,108 @@ function getRandomSecChUaPlatform() {
 //   0 = 启用深度思考（模型会花更多时间推理）
 //   4 = AUTO（自动选择思考深度，由 Gemini 决定）
 
+var REASONING_EFFORT_MAP = {
+  none: { think: 4, variant: 1 },
+  minimal: { think: 4, variant: 1 },
+  low: { think: 4, variant: 1 },
+  medium: { think: 2, variant: 4 },
+  high: { think: 0, variant: 2 },
+  xhigh: { think: 0, variant: 2 },
+  max: { think: 0, variant: 2 },
+};
+
+var THINK_TO_VARIANT = { 0: 2, 1: 2, 2: 4, 3: 1, 4: 1 };
+
 var MODELS = {
+  'gemini-4-hydrogen': {
+    mode: 1,
+    think: 4,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    levels: true,
+    desc: 'Gemini 4 Hydrogen (Everyday help; fast routing with Low/Medium/High thinking)',
+  },
+  'gemini-4-hydrogen-thinking': {
+    mode: 1,
+    think: 0,
+    variant: 2,
+    ticket: '56fdd199312815e2',
+    desc: 'Gemini 4 Hydrogen with extended thinking (High tier)',
+  },
+  'gemini-4-neon': {
+    mode: 3,
+    think: 4,
+    variant: 1,
+    ticket: 'e6fa609c3fa255c0',
+    levels: true,
+    desc: 'Gemini 4 Neon (Deeper analysis; replaced 3.1 Pro, requires cookie)',
+  },
+  'gemini-4-neon-thinking': {
+    mode: 3,
+    think: 0,
+    variant: 2,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Gemini 4 Neon with extended thinking (High tier, requires cookie)',
+  },
+  'gemini-4-carbon': {
+    mode: 8,
+    think: 2,
+    variant: 4,
+    ticket: '95a4c0abcba24364',
+    levels: true,
+    desc: 'Gemini 4 Carbon (Code & complex work, formerly 4 Argon; Ultra web routing)',
+  },
+  'gemini-4-carbon-thinking': {
+    mode: 8,
+    think: 0,
+    variant: 2,
+    ticket: '95a4c0abcba24364',
+    desc: 'Gemini 4 Carbon with extended thinking (High tier, Ultra web routing)',
+  },
+  'gemini-4-argon': {
+    mode: 8,
+    think: 2,
+    variant: 4,
+    ticket: '95a4c0abcba24364',
+    levels: true,
+    desc: 'Gemini 4 Argon (alias for gemini-4-carbon; Ultra web routing, medium thinking default)',
+  },
+  'gemini-4-argon-thinking': {
+    mode: 8,
+    think: 0,
+    variant: 2,
+    ticket: '95a4c0abcba24364',
+    desc: 'Gemini 4 Argon with extended thinking (High tier, Ultra web routing)',
+  },
+  'gemini-3.8-flash': {
+    mode: 1,
+    think: 4,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    levels: true,
+    desc: 'Fast all-around model (Flash family; serves 4 Hydrogen / 3.8 Flash)',
+  },
+  'gemini-3.8-flash-thinking': {
+    mode: 2,
+    think: 0,
+    variant: 2,
+    ticket: '56fdd199312815e2',
+    desc: 'Gemini 3.8 Flash with deep thinking (~20k chars)',
+  },
+  'gemini-3.8-flash-thinking-lite': {
+    mode: 5,
+    think: 0,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'Gemini 3.8 Flash with adaptive thinking depth',
+  },
+  'gemini-3.7-flash': {
+    mode: 1,
+    think: 4,
+    variant: 1,
+    ticket: '56fdd199312815e2',
+    desc: 'Latest all-around model (Gemini 3.7 Flash, routes to 4 Hydrogen)',
+  },
   'gemini-3.6-flash': {
     mode: 1,        // FAST - 快速模式
     think: 4,       // AUTO - 自动选择思考深度
@@ -458,7 +555,23 @@ var MODELS = {
   'gemini-3.1-pro': {
     mode: 3,        // PRO - 专业版
     think: 4,       // AUTO
-    desc: 'Pro model (requires cookie for real routing)',
+    variant: 1,
+    ticket: 'e6fa609c3fa255c0',
+    levels: true,
+    desc: 'Pro model (alias for gemini-4-neon; requires cookie for real routing)',
+  },
+  'gemini-3.1-pro-thinking': {
+    mode: 3,
+    think: 0,
+    variant: 2,
+    ticket: 'e6fa609c3fa255c0',
+    desc: 'Pro model with extended thinking (alias for gemini-4-neon-thinking)',
+  },
+  'gemini-3.1-pro-enhanced': {
+    mode: 3,
+    think: 4,
+    extra: { 31: 2, 80: 3 },
+    desc: 'Pro with enhanced output (experimental)',
   },
   'gemini-auto': {
     mode: 4,        // AUTO - 自动模型选择
@@ -473,9 +586,42 @@ var MODELS = {
   'gemini-flash-lite': {
     mode: 6,        // FLASH_LITE - 轻量快速
     think: 4,       // AUTO
+    variant: 1,
+    ticket: '8c46e95b1a07cecc',
     desc: 'Lightweight fast model',
   },
+  'gemini-3.5-flash-lite': {
+    mode: 6,
+    think: 4,
+    variant: 1,
+    ticket: '8c46e95b1a07cecc',
+    desc: 'Alias for gemini-flash-lite',
+  },
 };
+
+(function () {
+  var bases = ['gemini-4-hydrogen', 'gemini-4-neon', 'gemini-4-carbon', 'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.1-pro'];
+  var levels = [
+    ['low', 4, 1],
+    ['medium', 2, 4],
+    ['high', 0, 2],
+  ];
+  for (var bi = 0; bi < bases.length; bi++) {
+    var base = bases[bi];
+    var baseCfg = MODELS[base];
+    for (var li = 0; li < levels.length; li++) {
+      var lvl = levels[li];
+      MODELS[base + '-' + lvl[0]] = {
+        mode: baseCfg.mode,
+        think: lvl[1],
+        variant: lvl[2],
+        ticket: baseCfg.ticket,
+        levels: false,
+        desc: baseCfg.desc + ' (' + lvl[0] + ' thinking)',
+      };
+    }
+  }
+})();
 
 // ============================================================================
 // 🔑 核心：请求级配置生成器（解决并发串扰 + 多Cookie轮换 + 指纹轮换）

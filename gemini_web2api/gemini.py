@@ -5,25 +5,32 @@ import uuid
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import ssl
+import socket
 import os
 import hashlib
+import tempfile
+import threading
 
 try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
 from .config import CONFIG
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_cookie_lock = threading.Lock()
+_refresh_lock = threading.Lock()
 _httpx_client = None
 
 
 def log(msg: str):
-    if CONFIG["log_requests"]:
+    if CONFIG.get("log_requests", True):
         import sys
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
@@ -45,100 +52,282 @@ def _get_httpx_client():
     return _httpx_client
 
 
+def _extract_sapisid(cookie_str: str) -> str:
+    if not cookie_str:
+        return ""
+    m = re.search(r"(?:^|;\s*)SAPISID=([^;\s]+)", cookie_str)
+    if m:
+        return m.group(1)
+    m3 = re.search(r"(?:^|;\s*)__Secure-3PAPISID=([^;\s]+)", cookie_str)
+    return m3.group(1) if m3 else ""
+
+
+def _parse_netscape_cookies(raw: str) -> str:
+    pairs = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain = parts[0].lstrip(".").lower()
+            if domain == "google.com" or domain.endswith(".google.com"):
+                pairs[parts[5]] = parts[6]
+    return "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
+def _normalize_model_tickets(raw_tickets) -> dict:
+    if not isinstance(raw_tickets, dict):
+        return {}
+    clean = {}
+    for mk, mv in raw_tickets.items():
+        if len(clean) >= 32:
+            break
+        if (
+            isinstance(mk, str)
+            and isinstance(mv, str)
+            and re.fullmatch(r"gemini-[a-z0-9._-]{1,48}", mk.strip())
+            and re.fullmatch(r"[0-9a-fA-F]{16}", mv.strip())
+        ):
+            clean[mk.strip()] = mv.strip().lower()
+    return clean
+
+
+def _normalize_metadata(data: dict) -> dict:
+    meta = {}
+    for k in ("xsrf_token", "gemini_bl"):
+        val = data.get(k)
+        if isinstance(val, str) and val.strip() and not any(c in val for c in "\r\n\x00"):
+            meta[k] = val.strip()
+    au = data.get("auth_user")
+    if isinstance(au, (int, str)) and not isinstance(au, bool) and str(au).strip().isdigit():
+        meta["auth_user"] = str(au).strip()
+    tickets = _normalize_model_tickets(data.get("model_tickets"))
+    if tickets:
+        meta["model_tickets"] = tickets
+    return meta
+
+
+def update_cookie_payload(data: dict) -> tuple:
+    """Validate and apply a pushed cookie payload. Returns (ok: bool, err_msg: str, status: int)."""
+    if not isinstance(data, dict):
+        return False, "invalid JSON object", 400
+    raw_cookie = data.get("cookie")
+    if not isinstance(raw_cookie, str) or not raw_cookie.strip():
+        return False, "missing or invalid cookie field", 400
+    cookie_str = raw_cookie.strip()
+    if len(cookie_str) > 16384 or any(c in cookie_str for c in "\r\n\x00"):
+        return False, "invalid characters or length in cookie field", 400
+    sapisid = _extract_sapisid(cookie_str)
+    meta = _normalize_metadata(data)
+
+    with _cookie_lock:
+        same_cookie = cookie_str == _cookie_cache.get("str") and (sapisid or None) == _cookie_cache.get("sapisid")
+        cur_tickets = dict(CONFIG.get("model_tickets") or {})
+        new_tickets = meta.get("model_tickets") or {}
+        tickets_changed = any(cur_tickets.get(k) != v for k, v in new_tickets.items())
+        scalar_changed = any(meta.get(k) != CONFIG.get(k) for k in meta if k != "model_tickets")
+        has_new_meta = scalar_changed or tickets_changed
+        if same_cookie and not has_new_meta:
+            return True, "", 200
+
+        merged_tickets = dict(cur_tickets)
+        merged_tickets.update(new_tickets)
+
+        cf = CONFIG.get("cookie_file")
+        mtime = _cookie_cache["mtime"]
+        if cf:
+            tmp_path = None
+            try:
+                existing = {}
+                if os.path.exists(cf):
+                    with open(cf, "r", encoding="utf-8-sig") as rf:
+                        raw_existing = rf.read().strip()
+                    if raw_existing.startswith("{"):
+                        loaded = json.loads(raw_existing)
+                        if isinstance(loaded, dict):
+                            existing = loaded
+                existing["cookie"] = cookie_str
+                if sapisid:
+                    existing["sapisid"] = sapisid
+                disk_tickets = _normalize_model_tickets(existing.get("model_tickets"))
+                if disk_tickets or merged_tickets:
+                    combined = dict(cur_tickets)
+                    combined.update(disk_tickets)
+                    combined.update(new_tickets)
+                    merged_tickets = _normalize_model_tickets(combined)
+                    existing["model_tickets"] = merged_tickets
+                for k, v in meta.items():
+                    if k != "model_tickets":
+                        existing[k] = v
+                parent_dir = os.path.dirname(os.path.abspath(cf)) or "."
+                fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".cookie-", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as wf:
+                    json.dump(existing, wf, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, cf)
+                tmp_path = None
+                mtime = os.path.getmtime(cf)
+            except Exception as e:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                log(f"Cookie persist error: {e}")
+                return False, "failed to persist cookie file", 500
+
+        for k, v in meta.items():
+            if k != "model_tickets":
+                CONFIG[k] = v
+        if merged_tickets:
+            CONFIG["model_tickets"] = merged_tickets
+        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        log("Updated cookies via /v1/cookies")
+        return True, "", 200
+
+
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
-    cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file or not os.path.exists(cookie_file):
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        candidates = [
-            cookie_file,
-            os.path.join(base_dir, "cookie.json"),
-            os.path.join(base_dir, "cookie.txt"),
-            "./cookie.json",
-            "cookie.json",
-            os.path.expanduser("~/.config/gemini-web2api/cookie.json")
-        ]
-        found = False
-        for c in candidates:
-            if c and os.path.exists(c):
-                cookie_file = c
-                CONFIG["cookie_file"] = c
-                found = True
-                break
-        if not found:
-            return "", None
-    try:
-        mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+    with _cookie_lock:
+        cookie_file = CONFIG.get("cookie_file")
+        if not cookie_file or not os.path.exists(cookie_file):
+            if cookie_file is None and not _cookie_cache["str"]:
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                candidates = [
+                    os.path.join(base_dir, "cookie.json"),
+                    os.path.join(base_dir, "cookie.txt"),
+                    "./cookie.json",
+                    "cookie.json",
+                    os.path.expanduser("~/.config/gemini-web2api/cookie.json"),
+                ]
+                for c in candidates:
+                    if c and os.path.exists(c):
+                        cookie_file = c
+                        CONFIG["cookie_file"] = c
+                        break
+            if not cookie_file or not os.path.exists(cookie_file):
+                return _cookie_cache["str"], _cookie_cache["sapisid"]
+        try:
+            mtime = os.path.getmtime(cookie_file)
+            if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+                return _cookie_cache["str"], _cookie_cache["sapisid"]
+            with open(cookie_file, "r", encoding="utf-8-sig") as f:
+                content = f.read().strip()
+            if content.startswith("{"):
+                data = json.loads(content)
+                cookie_str = data.get("cookie", "")
+                sapisid = data.get("sapisid", "") or _extract_sapisid(cookie_str)
+                meta = _normalize_metadata(data)
+                if meta.get("xsrf_token"):
+                    CONFIG["xsrf_token"] = meta["xsrf_token"]
+                if meta.get("gemini_bl"):
+                    CONFIG["gemini_bl"] = meta["gemini_bl"]
+                if meta.get("auth_user") and CONFIG.get("auth_user") in (None, ""):
+                    CONFIG["auth_user"] = meta["auth_user"]
+                if "model_tickets" in meta:
+                    cur_tickets = dict(CONFIG.get("model_tickets") or {})
+                    cur_tickets.update(meta["model_tickets"])
+                    CONFIG["model_tickets"] = cur_tickets
+            elif "\t" in content:
+                cookie_str = _parse_netscape_cookies(content)
+                sapisid = _extract_sapisid(cookie_str)
+            else:
+                cookie_str = content
+                sapisid = _extract_sapisid(cookie_str)
+            _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+            return cookie_str, sapisid if sapisid else None
+        except Exception as e:
+            log(f"Cookie load error: {e}")
             return _cookie_cache["str"], _cookie_cache["sapisid"]
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-            if not CONFIG.get("xsrf_token") and data.get("xsrf_token"):
-                CONFIG["xsrf_token"] = data.get("xsrf_token")
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
-        return cookie_str, sapisid if sapisid else None
-    except Exception as e:
-        log(f"Cookie load error: {e}")
-        return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
-def save_xsrf_token(token: str):
-    """Save recovered xsrf_token into config and cookie file."""
-    CONFIG["xsrf_token"] = token
+def save_xsrf_token(token: str, gemini_bl: str = None):
+    """Save recovered xsrf_token (and optional gemini_bl) into config and cookie file."""
+    if token:
+        CONFIG["xsrf_token"] = token
+    if gemini_bl:
+        CONFIG["gemini_bl"] = gemini_bl
     cookie_file = CONFIG.get("cookie_file")
     if cookie_file and os.path.exists(cookie_file):
         try:
-            with open(cookie_file, "r", encoding="utf-8") as f:
-                cdata = json.load(f)
-            cdata["xsrf_token"] = token
-            with open(cookie_file, "w", encoding="utf-8") as f:
-                json.dump(cdata, f, indent=2)
+            with open(cookie_file, "r", encoding="utf-8-sig") as f:
+                raw = f.read().strip()
+            if raw.startswith("{"):
+                cdata = json.loads(raw)
+                if token:
+                    cdata["xsrf_token"] = token
+                if gemini_bl:
+                    cdata["gemini_bl"] = gemini_bl
+                with open(cookie_file, "w", encoding="utf-8") as f:
+                    json.dump(cdata, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+
+_BL_PATTERN = re.compile(
+    r"(boq_gemini-web-uiserver_\d+\.\d+_p\d+|boq_assistant-bard-web-server_\d+\.\d+_p\d+)"
+)
+
+
+def _fetch_gemini_page_html(cookie_str: str = "", sapisid: str = None, timeout: int = 15) -> tuple:
+    """Fetch gemini.google.com/app and return (html, final_url)."""
+    account_prefix = _account_prefix()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+    if sapisid:
+        headers["Authorization"] = make_sapisidhash(sapisid)
+    req = urllib.request.Request(f"https://gemini.google.com{account_prefix}/app?hl=en", headers=headers)
+    ctx = _get_ssl_ctx()
+    proxy = CONFIG.get("proxy")
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        resp = opener.open(req, timeout=timeout)
+    else:
+        resp = urllib.request.urlopen(req, context=ctx, timeout=timeout)
+    final_url = resp.geturl() if hasattr(resp, "geturl") else ""
+    html = resp.read().decode("utf-8", errors="replace")
+    return html, final_url
+
+
+def _is_login_redirect(final_url: str, html: str) -> bool:
+    if final_url and "accounts.google.com" in final_url:
+        return True
+    if "boq_identityfrontendauthuiserver" in html:
+        return True
+    return False
 
 
 def fetch_latest_bl() -> str | None:
     """Fetch the latest gemini_bl and SNlM0e (xsrf) from gemini.google.com page."""
     try:
         cookie_str, sapisid = load_cookie()
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        if cookie_str:
-            headers["Cookie"] = cookie_str
-        if sapisid:
-            headers["Authorization"] = make_sapisidhash(sapisid)
-        prefix = _account_prefix()
-        target_url = f"https://gemini.google.com{prefix}/app"
-        req = urllib.request.Request(target_url, headers=headers)
-        ctx = _get_ssl_ctx()
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=ctx))
-            resp = opener.open(req, timeout=15)
+        html, final_url = _fetch_gemini_page_html(cookie_str, sapisid, timeout=15)
+        if _is_login_redirect(final_url, html):
+            log("Gemini /app redirected to accounts.google.com (cookie may lack OSID or session expired); fetching BL anonymously")
+            html, _ = _fetch_gemini_page_html("", None, timeout=15)
         else:
-            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
-        html = resp.read().decode("utf-8", errors="replace")
+            if not CONFIG.get("xsrf_token"):
+                m_xsrf = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', html)
+                if not m_xsrf:
+                    m_xsrf = re.search(r'"FdrFJe"\s*:\s*"(-?\d+)"', html)
+                if m_xsrf:
+                    save_xsrf_token(m_xsrf.group(1))
+                    log(f"XSRF token auto-detected from page: {CONFIG['xsrf_token']}")
 
-        if not CONFIG.get("xsrf_token"):
-            m_xsrf = re.search(r'"FdrFJe"\s*:\s*"(-?\d+)"', html)
-            if not m_xsrf:
-                m_xsrf = re.search(r'"SNlM0e":"([^"]+)"', html)
-            if not m_xsrf:
-                m_xsrf = re.search(r'SNlM0e[\'":=\s]*([A-Za-z0-9_\-]{10,})', html)
-            if m_xsrf:
-                save_xsrf_token(m_xsrf.group(1))
-                log(f"XSRF token auto-detected from page: {CONFIG['xsrf_token']}")
-
-        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        bl_m = re.search(r'"cfb2h"\s*:\s*"([^"]+)"', html)
+        if bl_m and not bl_m.group(1).startswith("boq_identityfrontend"):
+            return bl_m.group(1)
+        m = _BL_PATTERN.search(html)
         if m:
             return m.group(1)
     except Exception as e:
@@ -151,9 +340,43 @@ def update_bl_if_needed() -> bool:
     new_bl = fetch_latest_bl()
     if new_bl and new_bl != CONFIG["gemini_bl"]:
         log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
-        CONFIG["gemini_bl"] = new_bl
+        save_xsrf_token(None, gemini_bl=new_bl)
         return True
     return False
+
+
+def refresh_bl_and_xsrf() -> bool:
+    """Refresh gemini_bl and xsrf_token from gemini.google.com."""
+    old = (CONFIG.get("gemini_bl"), CONFIG.get("xsrf_token"))
+    with _refresh_lock:
+        if (CONFIG.get("gemini_bl"), CONFIG.get("xsrf_token")) != old:
+            return True
+        try:
+            cookie_str, sapisid = load_cookie()
+            html, final_url = _fetch_gemini_page_html(cookie_str, sapisid, timeout=15)
+            redirected_to_login = _is_login_redirect(final_url, html)
+            if redirected_to_login:
+                log("BL/XSRF refresh redirected to accounts.google.com; fetching BL anonymously without overwriting XSRF")
+                html, _ = _fetch_gemini_page_html("", None, timeout=15)
+
+            bl_m = re.search(r'"cfb2h"\s*:\s*"([^"]+)"', html)
+            if not bl_m or bl_m.group(1).startswith("boq_identityfrontend"):
+                bl_m = _BL_PATTERN.search(html)
+            if bl_m:
+                CONFIG["gemini_bl"] = bl_m.group(1)
+
+            if not redirected_to_login:
+                at_m = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', html)
+                if at_m:
+                    CONFIG["xsrf_token"] = at_m.group(1)
+
+            changed = (CONFIG.get("gemini_bl"), CONFIG.get("xsrf_token")) != old
+            if changed:
+                save_xsrf_token(CONFIG.get("xsrf_token"), CONFIG.get("gemini_bl"))
+            return changed
+        except Exception as e:
+            log(f"BL/XSRF auto-refresh failed: {e}")
+            return False
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -170,53 +393,26 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-MODEL_IDS = {
-    "gemini-3.8-flash": "56fdd199312815e2",
-    "gemini-3.7-flash": "56fdd199312815e2",
-    "gemini-3.6-flash": "56fdd199312815e2",
-    "gemini-3.5-flash": "56fdd199312815e2",
-    "gemini-3.1-pro": "e6fa609c3fa255c0",
-    "gemini-flash-lite": "8c46e95b1a07cecc",
-    "gemini-3.5-flash-thinking": "56fdd199312815e2",
-    "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
-    "gemini-auto": None,
-}
-
-
-def build_model_header(model_name: str, model_id: int):
-    mid = MODEL_IDS.get(model_name)
-    if not mid:
-        return None
-    try:
-        return json.dumps(
-            [1, None, None, None, mid, None, None, 0,
-             [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
-             None, None, model_id, 0, str(uuid.uuid4())],
-            separators=(",", ":"))
-    except Exception:
-        return None
-
-
-def _build_headers(model_name: str = None, model_id: int = None) -> dict:
+def _build_headers(extra_fields: dict = None) -> dict:
+    cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://gemini.google.com",
         "Referer": f"https://gemini.google.com{account_prefix}/app",
         "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    cookie_str, sapisid = load_cookie()
+    if extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True):
+        headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
+        headers["X-Goog-Ext-73010989-Jspb"] = "[0]"
+        headers["X-Goog-Ext-73010990-Jspb"] = "[0,0,0]"
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
-    if model_name and model_id is not None:
-        hdr = build_model_header(model_name, model_id)
-        if hdr:
-            headers["x-goog-ext-525001261-jspb"] = hdr
     return headers
 
 
@@ -253,9 +449,26 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True):
+        variant = extra_fields.get("_variant", 1)
+        inner[17] = [[0]]
+        inner[41] = [1]
+        inner[80] = variant
+        inner[91] = 0
+        inner[96] = 1 if variant != 1 else 0
+        if model_id == 8:
+            inner[6] = [1]
+            inner[30] = []
+            inner[49] = 40
+            inner[68] = 2
+            inner[83] = 1
+            inner[91] = 1
+            inner[96] = 1
+            inner[98] = 1
     if extra_fields:
         for k, v in extra_fields.items():
-            inner[k] = v
+            if isinstance(k, int):
+                inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
@@ -305,6 +518,70 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+_CANNED_ERROR_RE = re.compile(
+    r"^\W*(?:i'?m having a hard time fulfilling your request"
+    r"|sorry,? something went wrong"
+    r"|something went wrong\.? please try"
+    r"|i seem to be encountering an error"
+    r"|i encountered an error doing what you asked"
+    r"|an error occurred\.? please try"
+    r"|i'?m unable to (?:process|complete) (?:that|this|your) request right now)"
+    r"[^\n]{0,120}$",
+    re.IGNORECASE,
+)
+
+
+class _TicketRejectedError(Exception):
+    pass
+
+
+def _is_canned_error(text: str) -> bool:
+    if not text:
+        return False
+    s = text.strip().replace("\u2019", "'")
+    if not s or len(s) > 300:
+        return False
+    return bool(_CANNED_ERROR_RE.match(s))
+
+
+def _strip_ticket(extra_fields: dict) -> dict:
+    if not extra_fields or not extra_fields.get("_ticket"):
+        return extra_fields
+    return {k: v for k, v in extra_fields.items() if k not in ("_ticket", "_variant")}
+
+
+def _ticket_timeout() -> float:
+    try:
+        req_t = float(CONFIG.get("request_timeout_sec") or 180)
+    except (ValueError, TypeError):
+        req_t = 180.0
+    raw_tt = CONFIG.get("ticket_timeout_sec", 25)
+    if raw_tt is None:
+        return max(1.0, min(req_t, 25.0))
+    try:
+        tt = float(raw_tt)
+    except (ValueError, TypeError):
+        tt = 25.0
+    if tt <= 0:
+        return max(1.0, req_t)
+    return max(1.0, min(req_t, tt))
+
+
+def _is_timeout_error(err: BaseException) -> bool:
+    if isinstance(err, urllib.error.HTTPError):
+        return False
+    if HAS_HTTPX and httpx is not None:
+        if isinstance(err, (httpx.HTTPStatusError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return False
+    if isinstance(err, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), (TimeoutError, socket.timeout)):
+        return True
+    if HAS_HTTPX and httpx is not None and isinstance(err, httpx.TimeoutException):
+        return True
+    return "timed out" in str(err).lower() or "timeout" in type(err).__name__.lower()
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
@@ -318,16 +595,35 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
+def _ensure_extra_ticket(extra_fields: dict = None, model_name: str = None) -> dict:
+    if model_name and (not extra_fields or "_ticket" not in extra_fields):
+        from .models import resolve_model
+        _, _, _, _, resolved_extra = resolve_model(model_name)
+        if resolved_extra:
+            merged = dict(resolved_extra)
+            if extra_fields:
+                merged.update(extra_fields)
+            return merged
+    return extra_fields
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, model_name: str = None) -> str:
     """Non-streaming generation with retry."""
-    headers = _build_headers(model_name, model_id)
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
+    load_cookie()
+    extra_fields = _ensure_extra_ticket(extra_fields, model_name)
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    refreshed = False
 
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
+    attempt = 0
+    while attempt < attempts:
+        body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+        url = _get_url()
+        headers = _build_headers(extra_fields)
+        has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+        req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -335,70 +631,92 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                resp = opener.open(req, timeout=req_timeout)
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+                resp = urllib.request.urlopen(req, context=ctx, timeout=req_timeout)
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
-        except urllib.error.HTTPError as e:
-            if e.code == 405 and update_bl_if_needed():
-                url = _get_url()
-                log("Retrying with updated BL...")
-                last_err = e
+            text = extract_response_text(raw)
+            if has_ticket and _is_canned_error(text):
+                extra_fields = _strip_ticket(extra_fields)
+                log("Model ticket returned canned error; falling back without X-Goog-Ext-525001261-Jspb header")
                 continue
-            if e.code == 400:
+            return text
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 400 and not refreshed:
                 try:
-                    err_body = e.read().decode("utf-8", errors="replace")
+                    err_body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
                     m = re.search(r'\["xsrf",\s*"([^"]+)"', err_body)
                     if m:
-                        new_xsrf = m.group(1)
-                        log(f"XSRF auto-recovered from 400: {new_xsrf}")
-                        save_xsrf_token(new_xsrf)
-                        body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-                        last_err = e
+                        refreshed = True
+                        save_xsrf_token(m.group(1))
+                        log(f"XSRF auto-recovered from 400: {m.group(1)}")
                         continue
-                except Exception as ex:
-                    log(f"XSRF recovery parse error: {ex}")
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                except Exception:
+                    pass
+            if e.code in (400, 405) and not refreshed and refresh_bl_and_xsrf():
+                refreshed = True
+                log(f"HTTP {e.code}: refreshed BL/XSRF, retrying immediately...")
+                continue
+            attempt += 1
+            if attempt < attempts:
+                log(f"Retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
+            if has_ticket and (_is_timeout_error(e) or (isinstance(e, RuntimeError) and "BardErrorInfo" in str(e))):
+                extra_fields = _strip_ticket(extra_fields)
+                log(f"Model ticket rejected or timed out ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
+                continue
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            attempt += 1
+            if attempt < attempts:
+                log(f"Retry {attempt}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, model_name: str = None):
     """Streaming generation via httpx with retry on connection failure."""
+    extra_fields = _ensure_extra_ticket(extra_fields, model_name)
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
         return
 
-    headers = _build_headers(model_name, model_id)
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
+    load_cookie()
     client = _get_httpx_client()
+    refreshed = False
 
+    last_err = None
     emitted_raw_text = ""
-    for attempt in range(CONFIG["retry_attempts"]):
+    yielded_any = False
+    attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
+    attempt = 0
+    while attempt < attempts:
+        body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+        url = _get_url()
+        headers = _build_headers(extra_fields)
+        has_ticket = bool(extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True))
+        req_timeout = _ticket_timeout() if has_ticket else CONFIG["request_timeout_sec"]
+        pending = None
         try:
-            with client.stream("POST", url, content=body, headers=headers) as resp:
-                if resp.status_code == 405:
-                    update_bl_if_needed()
-                    raise RuntimeError("HTTP 405, BL updated")
-                if resp.status_code == 400:
-                    err_text = resp.read().decode("utf-8", errors="replace")
-                    m = re.search(r'\["xsrf",\s*"([^"]+)"', err_text)
-                    if m:
-                        new_xsrf = m.group(1)
-                        log(f"XSRF auto-recovered from stream 400: {new_xsrf}")
-                        save_xsrf_token(new_xsrf)
-                    raise RuntimeError("HTTP 400 Bad Request, recovered XSRF")
+            with client.stream("POST", url, content=body, headers=headers, timeout=req_timeout) as resp:
+                if resp.status_code in (400, 405) and not refreshed and not yielded_any:
+                    refreshed = True
+                    if resp.status_code == 400:
+                        try:
+                            err_text = resp.read().decode("utf-8", errors="replace")
+                            m = re.search(r'\["xsrf",\s*"([^"]+)"', err_text)
+                            if m:
+                                save_xsrf_token(m.group(1))
+                                log(f"XSRF auto-recovered from stream 400: {m.group(1)}")
+                                continue
+                        except Exception:
+                            pass
+                    if refresh_bl_and_xsrf():
+                        log(f"Stream HTTP {resp.status_code}: refreshed BL/XSRF, retrying immediately...")
+                        continue
                 resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
@@ -406,6 +724,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     if "BardErrorInfo" in buf:
                         bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if bard_err:
+                            if not yielded_any and has_ticket:
+                                raise _TicketRejectedError(f"BardErrorInfo [{bard_err.group(1)}]")
                             raise RuntimeError(
                                 f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
                             )
@@ -416,14 +736,39 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 continue
                             if not t.startswith(emitted_raw_text):
                                 raise RuntimeError("Gemini stream content changed during retry")
+                            if has_ticket and not yielded_any:
+                                if len(t) <= 300:
+                                    pending = t
+                                    continue
+                                pending = None
                             delta = clean_text(t[len(emitted_raw_text):], strip=False)
                             emitted_raw_text = t
                             if delta:
+                                yielded_any = True
                                 yield delta
+                if pending is not None:
+                    if _is_canned_error(clean_text(pending)):
+                        raise _TicketRejectedError("canned error")
+                    delta = clean_text(pending, strip=False)
+                    emitted_raw_text = pending
+                    if delta:
+                        yielded_any = True
+                        yield delta
             return
+        except _TicketRejectedError as e:
+            extra_fields = _strip_ticket(extra_fields)
+            log(f"Stream model ticket rejected ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
+            continue
         except Exception as e:
-            log(f"Stream error ({e}), retrying via non-streaming fallback...")
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
-            if text:
-                yield text
-            return
+            if not yielded_any and has_ticket and _is_timeout_error(e):
+                extra_fields = _strip_ticket(extra_fields)
+                log(f"Stream model ticket timed out ({e}); falling back without X-Goog-Ext-525001261-Jspb header")
+                continue
+            if yielded_any:
+                raise
+            last_err = e
+            attempt += 1
+            if attempt < attempts:
+                log(f"Stream retry {attempt}/{attempts}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
+    raise last_err

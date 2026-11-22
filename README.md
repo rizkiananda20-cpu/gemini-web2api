@@ -88,17 +88,25 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
+| `gemini-4-hydrogen` | Everyday help (Gemini 4 Hydrogen; supports `-low`, `-medium`, `-high`, `-thinking`) | ~12k–20k chars |
+| `gemini-4-neon` | Deeper analysis (Gemini 4 Neon, replaced 3.1 Pro; needs cookie; supports `-low`, `-medium`, `-high`, `-thinking`) | ~20k chars |
+| `gemini-4-carbon` | Code & complex work (Gemini 4 Carbon, formerly 4 Argon; needs Ultra cookie; supports `-low`, `-medium`, `-high`, `-thinking`) | ~20k chars |
+| `gemini-4-argon` | Alias for `gemini-4-carbon` (supports `-low`, `-medium`, `-high`, `-thinking`) | ~20k chars |
+| `gemini-3.8-flash` | Fast all-around model (routes to 4 Hydrogen / 3.8 Flash; supports `-low`, `-medium`, `-high`) | ~12k chars |
+| `gemini-3.8-flash-thinking` | Extended thinking mode (~20k chars) | **~20k chars** |
+| `gemini-3.8-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
+| `gemini-3.7-flash` | Latest all-around model (routes to 4 Hydrogen) | ~12k chars |
+| `gemini-3.6-flash` | All-around model | ~12k chars |
 | `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
 | `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
+| `gemini-3.1-pro` | Advanced math & code (alias for `gemini-4-neon`; needs cookie) | ~12k–20k chars |
 | `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
+| `gemini-flash-lite` | Fastest answers, lightweight (`gemini-3.5-flash-lite` alias) | ~10k chars |
 
-### Thinking Depth
+### Thinking Depth & `reasoning_effort`
 
-Append `@think=N` to any model name:
+Append `-low`, `-medium`, `-high` (or pass `reasoning_effort: "low" | "medium" | "high"`) on `gemini-4-hydrogen`, `gemini-4-neon`, `gemini-4-carbon`, `gemini-4-argon`, `gemini-3.8-flash`, or `gemini-3.1-pro`, or append `@think=N` to any model name:
 
 ```
 gemini-3.5-flash-thinking@think=0   # deepest (default)
